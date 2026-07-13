@@ -27,6 +27,16 @@ except ImportError:  # pragma: no cover
 csv.field_size_limit(10 * 1024 * 1024)
 
 log = logging.getLogger("intelxtract")
+print("")
+
+BANNER = r""" █████             █████             ████  █████ █████  █████
+░░███             ░░███             ░░███ ░░███ ░░███  ░░███
+ ░███  ████████   ███████    ██████  ░███  ░░███ ███   ███████   ████████   ██████    ██████  ███████
+ ░███ ░░███░░███ ░░░███░    ███░░███ ░███   ░░█████   ░░░███░   ░░███░░███ ░░░░░███  ███░░███░░░███░
+ ░███  ░███ ░███   ░███    ░███████  ░███    ███░███    ░███     ░███ ░░░   ███████ ░███ ░░░   ░███
+ ░███  ░███ ░███   ░███ ███░███░░░   ░███   ███ ░░███   ░███ ███ ░███      ███░░███ ░███  ███  ░███ ███
+ █████ ████ █████  ░░█████ ░░██████  █████ █████ █████  ░░█████  █████    ░░████████░░██████   ░░█████
+░░░░░ ░░░░ ░░░░░    ░░░░░   ░░░░░░  ░░░░░ ░░░░░ ░░░░░    ░░░░░  ░░░░░      ░░░░░░░░  ░░░░░░     ░░░░░"""
 
 # Adjust here if your export/combolist format differs
 PROFESSIONAL_SHEET = "Professional Leaks"
@@ -34,7 +44,7 @@ PERSONAL_SHEET = "Personal Leaks"
 SUMMARY_SHEET = "Summary"
 
 FIELD_DELIMITERS = [":", ";", "|", "\t", ","]
-TABLE_DELIMITERS = [",", "\t", ";", "|"]  # ':' is handled per-line (email:pass, url:user:pass)
+TABLE_DELIMITERS = [",", "\t", ";", "|"]  # ':' is handled per-line
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{1,63}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
@@ -54,6 +64,19 @@ PHONE_ALLOWED_RE = re.compile(r"^[\d+().\-\s]+$")  # only phone-ish chars
 PHONE_SEP_RE = re.compile(r"[-+.()\s]")            # must carry phone formatting
 IPV4_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
 IPV6ISH_RE = re.compile(r"^[0-9a-fA-F:]+$")
+
+PLACEHOLDER_VALUES = {
+    "xxx", "n/a", "na", "none", "null", "unknown", "-", "--", "*", "****",
+    "notfound", "not found", "nopassword", "no password", "redacted",
+    "hidden", "removed", "empty", "n\\a", "nil",
+}
+PLACEHOLDER_X_RE = re.compile(r"^x+$", re.IGNORECASE)
+URLISH_RE = re.compile(r"^(https?|ftp)://|^www\.", re.IGNORECASE)
+
+NAME_LIKE_RE = re.compile(r"^[A-Z][a-z]+$")
+
+ALL_UPPER_LETTERS_RE = re.compile(r"^[A-Z]+$")
+MIN_SUSPICIOUS_UPPER_LEN = 16
 
 MAX_PASSWORD_LEN = 128
 TEXT_EXTENSIONS = {".txt", ".csv", ".log", ".tsv", ".dat", ".sql", ".json", ""}
@@ -90,7 +113,7 @@ class Credential:
 
 # Value classifiers
 def _is_hash(v: str) -> bool:
-    """A hashed password (still a leaked credential -> keep)."""
+    """A hashed password (leaked credential = keep)"""
     if CRYPT_RE.match(v):
         return True
     if HEX_ONLY_RE.match(v) and len(v) in HASH_HEX_LENGTHS:
@@ -119,7 +142,8 @@ def _looks_like_ip(v: str) -> bool:
 
 def _is_garbage(v: str) -> bool:
     """Values that are NOT credentials: record GUIDs/ObjectIds, long non-hash
-    hex ids, dates, amounts, phone numbers, IPs."""
+    hex ids, dates, amounts, phone numbers, IPs, placeholders, URLs/domains,
+    stray emails, and masked/anonymized-looking tokens."""
     if _is_hash(v):
         return False
     if UUID_RE.match(v):                          # IntelX record GUID
@@ -134,6 +158,15 @@ def _is_garbage(v: str) -> bool:
         return True
     if _looks_like_ip(v):
         return True
+    low = v.lower()
+    if low in PLACEHOLDER_VALUES or PLACEHOLDER_X_RE.match(v):
+        return True                                # "xxx", "n/a", etc
+    if URLISH_RE.match(v) or HOST_RE.match(v):
+        return True                                # link or domain sitting in the password field
+    if EMAIL_RE.fullmatch(v):
+        return True                                # password field holding an email
+    if ALL_UPPER_LETTERS_RE.match(v) and len(v) >= MIN_SUSPICIOUS_UPPER_LEN:
+        return True                                # not a real hash or password
     return False
 
 # Low-level helpers
@@ -186,7 +219,7 @@ def parse_date(value) -> Optional[datetime]:
     return None
 
 
-def _clean_password(pwd: str, allow_spaces: bool = False, strict: bool = False) -> Optional[str]:
+def _clean_password(pwd: str, allow_spaces: bool = False, reject_comma: bool = False) -> Optional[str]:
     pwd = pwd.strip()
     if not pwd or len(pwd) > MAX_PASSWORD_LEN:
         return None
@@ -194,12 +227,22 @@ def _clean_password(pwd: str, allow_spaces: bool = False, strict: bool = False) 
         return None
     if not any(c.isalnum() for c in pwd):
         return None
-    if strict:
-        if "," in pwd:          # a field still containing a comma is a CSV record, not a password
-            return None
-        if _is_garbage(pwd):    # GUIDs/ObjectIds/dates/amounts (hashes pass)
-            return None
+    if reject_comma and "," in pwd:  # a field still containing a comma is a CSV record, not a password
+        return None
+    if _is_garbage(pwd):    # hashes pass
+        return None
     return pwd
+
+
+def _pwd_matches_identity(identity: str, pwd: str) -> bool:
+    """Reject a 'password' that is actually the identity itself or a name/PII
+    fragment of it"""
+    local = identity.split("@", 1)[0].lower()
+    pwd_l = pwd.lower()
+    if pwd_l == identity.lower() or pwd_l == local:
+        return True
+    parts = [p for p in re.split(r"[._\-]+", local) if len(p) >= 2]
+    return pwd_l in parts
 
 
 def extract_host(url: Optional[str]) -> Optional[str]:
@@ -233,8 +276,8 @@ def parse_line(line: str) -> Optional[tuple[Optional[str], str, str, bool]]:
             field = after[1:].split(sep, 1)[0]
         else:
             field = after
-        pwd = _clean_password(field.strip(), strict=True)
-        if pwd is None:
+        pwd = _clean_password(field.strip(), reject_comma=True)
+        if pwd is None or _pwd_matches_identity(email, pwd):
             return None
         return (url, email.lower(), pwd, True)
 
@@ -243,8 +286,9 @@ def parse_line(line: str) -> Optional[tuple[Optional[str], str, str, bool]]:
         if len(parts) >= 3:
             user, pwd = parts[-2].strip(), parts[-1].strip()
             url = ":".join(parts[:-2]).strip() or None
-            pwd_c = _clean_password(pwd, strict=True)
-            if USERNAME_RE.match(user) and pwd_c is not None:
+            pwd_c = _clean_password(pwd, reject_comma=True)
+            if (USERNAME_RE.match(user) and pwd_c is not None
+                    and not _pwd_matches_identity(user, pwd_c)):
                 return (url, user, pwd_c, False)
         return None
 
@@ -253,8 +297,9 @@ def parse_line(line: str) -> Optional[tuple[Optional[str], str, str, bool]]:
             parts = line.split(d)
             if len(parts) == 2:
                 user, pwd = parts[0].strip(), parts[1].strip()
-                pwd_c = _clean_password(pwd, strict=True)
-                if USERNAME_RE.match(user) and pwd_c is not None:
+                pwd_c = _clean_password(pwd, reject_comma=True)
+                if (USERNAME_RE.match(user) and pwd_c is not None
+                        and not _pwd_matches_identity(user, pwd_c)):
                     return (None, user, pwd_c, False)
             return None
     return None
@@ -275,6 +320,9 @@ def _pwd_score(values: list[str]) -> float:
     score = good / len(vals)
     if len(set(vals)) / len(vals) < 0.3:   # low cardinality => categorical
         score *= 0.3
+    namelike = sum(1 for v in vals if NAME_LIKE_RE.match(v)) / len(vals)
+    if namelike >= 0.6:                    # column is mostly name shaped values
+        score *= 0.2
     return score
 
 
@@ -283,10 +331,13 @@ def _column_is_garbage(values: list[str]) -> bool:
     if not vals:
         return True
     bad = sum(1 for v in vals if _is_garbage(v))
-    return bad / len(vals) >= 0.7
+    if bad / len(vals) >= 0.7:
+        return True
+    namelike = sum(1 for v in vals if NAME_LIKE_RE.match(v)) / len(vals)
+    return namelike >= 0.6                 # not a password column
 
 
-def _iter_tabular(text: str, delim: str, width: int):
+def _iter_tabular(text: str, delim: str, width: int, source_name: str = ""):
     sample = list(itertools.islice(csv.reader(io.StringIO(text), delimiter=delim), SAMPLE_ROWS))
     sample = [r for r in sample if len(r) >= 2]
     if not sample:
@@ -299,9 +350,10 @@ def _iter_tabular(text: str, delim: str, width: int):
         vals = col(i)
         return (sum(1 for v in vals if pred(v.strip())) / len(vals)) if vals else 0.0
 
+    label = source_name or "<file>"
     email_col = max(range(width), key=lambda i: frac(i, lambda v: bool(EMAIL_RE.fullmatch(v))), default=None)
     if email_col is None or frac(email_col, lambda v: bool(EMAIL_RE.fullmatch(v))) < 0.3:
-        log.debug("Skipping table with no email column (%d cols, delim %r).", width, delim)
+        log.debug("Skipping %s: no email column found (%d cols, delim %r).", label, width, delim)
         return
     id_col = email_col
 
@@ -318,7 +370,7 @@ def _iter_tabular(text: str, delim: str, width: int):
             if bs >= 0.5:
                 pwd_col = bi
     if pwd_col is None:
-        log.debug("Skipping file with no password column (%d cols, delim %r).", width, delim)
+        log.debug("Skipping %s: no password column found (%d cols, delim %r).", label, width, delim)
         return
 
     url_col = None
@@ -337,14 +389,14 @@ def _iter_tabular(text: str, delim: str, width: int):
         if not EMAIL_RE.fullmatch(identity):
             continue
         identity = identity.lower()
-        pwd = _clean_password(row[pwd_col].strip(), allow_spaces=True, strict=True)
-        if pwd is None:
+        pwd = _clean_password(row[pwd_col].strip(), allow_spaces=True, reject_comma=True)
+        if pwd is None or _pwd_matches_identity(identity, pwd):
             continue
         url = row[url_col].strip() if url_col is not None else None
         yield (url, identity, pwd, True)
 
 
-def _iter_header_csv(text: str):
+def _iter_header_csv(text: str, source_name: str = ""):
     reader = csv.reader(io.StringIO(text))
     try:
         header = next(reader)
@@ -365,18 +417,23 @@ def _iter_header_csv(text: str):
     pass_i = find("password", "pass", "pwd", "senha", "hash")
     url_i = find("url", "host", "domain", "website", "site")
     if email_i is None or pass_i is None:
+        log.debug("Skipping %s: header row detected but no email/password column found.",
+                  source_name or "<file>")
         return
     for row in reader:
         if len(row) <= max(email_i, pass_i):
             continue
         identity = row[email_i].strip()
-        pwd = _clean_password(row[pass_i].strip(), allow_spaces=True)  # header trusted
+        pwd = _clean_password(row[pass_i].strip(), allow_spaces=True)
         if not identity or pwd is None:
             continue
         url = row[url_i].strip() if (url_i is not None and len(row) > url_i) else None
         if EMAIL_RE.fullmatch(identity):
-            yield (url, identity.lower(), pwd, True)
-        elif USERNAME_RE.match(identity):
+            identity = identity.lower()
+            if _pwd_matches_identity(identity, pwd):
+                continue
+            yield (url, identity, pwd, True)
+        elif USERNAME_RE.match(identity) and not _pwd_matches_identity(identity, pwd):
             yield (url, identity, pwd, False)
 
 
@@ -394,7 +451,7 @@ def _table_shape(sample_lines: list[str]) -> Optional[tuple[str, int]]:
     return (best[0], best[1]) if best else None
 
 
-def iter_credentials_from_text(text: str):
+def iter_credentials_from_text(text: str, source_name: str = ""):
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if not lines:
         return
@@ -406,12 +463,12 @@ def iter_credentials_from_text(text: str):
         and any(sep in sample[0] for sep in (",", ";", "\t"))
     )
     if header_like:
-        yield from _iter_header_csv(text)
+        yield from _iter_header_csv(text, source_name)
         return
 
     shape = _table_shape(sample)
     if shape:
-        yield from _iter_tabular(text, shape[0], shape[1])
+        yield from _iter_tabular(text, shape[0], shape[1], source_name)
         return
 
     for ln in lines:
@@ -523,6 +580,7 @@ def load_metadata_index(zf: zipfile.ZipFile) -> tuple[dict, set]:
         if matched:
             consumed.add(info.filename)
     if index:
+        print("")
         log.info("Loaded metadata for %d item(s) from index file(s).", len(index))
     return index, consumed
 
@@ -602,9 +660,13 @@ def classify(c: Credential, domain: Optional[str], relevant_files: set) -> str:
 # Streaming collection
 def iter_zip_credentials(zf, meta_index, consumed) -> Iterator[Credential]:
     for info in zf.infolist():
-        if info.is_dir() or info.filename in consumed:
+        if info.is_dir():
+            continue
+        if info.filename in consumed:
+            log.debug("Skipping %s: consumed as a metadata index file.", info.filename)
             continue
         if Path(info.filename).suffix.lower() not in TEXT_EXTENSIONS:
+            log.debug("Skipping %s: unsupported extension.", info.filename)
             continue
         try:
             text = _decode(zf.read(info.filename))
@@ -612,15 +674,20 @@ def iter_zip_credentials(zf, meta_index, consumed) -> Iterator[Credential]:
             log.warning("Could not read %s: %s", info.filename, e)
             continue
         if not text.strip():
+            log.debug("Skipping %s: empty file.", info.filename)
             continue
         leak_name, leak_date = resolve_metadata(info, meta_index)
         base = Path(info.filename).name
-        for url, identity, password, is_email in iter_credentials_from_text(text):
+        found = 0
+        for url, identity, password, is_email in iter_credentials_from_text(text, info.filename):
+            found += 1
             yield Credential(
                 identity=identity, password=password, leak_name=leak_name,
                 leak_date=leak_date, source_file=base, is_email=is_email,
                 host=extract_host(url),
             )
+        if found == 0:
+            log.debug("Skipping %s: no email/password pattern recognized.", info.filename)
 
 
 def _keep_over(candidate: Credential, current: Credential) -> bool:
@@ -802,9 +869,13 @@ def add_summary_sheet(wb, professional, personal, domain, stats, args, spill_pat
     r += 1
     ws.cell(row=r, column=1,
             value=("Passwords (plaintext) and password hashes (MD5/SHA/bcrypt) are both kept "
-                   "as credentials. Non-credential values -- record GUIDs, ObjectIds, dates "
-                   "and amounts -- are excluded. 'Unrelated' lines are credentials in the same "
-                   "exported files but not tied to the domain (see --include-unrelated)."))
+                   "as credentials. Non-credential values are excluded: record GUIDs/ObjectIds, "
+                   "dates, amounts, phone numbers, IPs, placeholders ('xxx', 'n/a', '-'), links/"
+                   "domains sitting in the password field, an email echoed as its own password, "
+                   "a Last/First Name field mistaken for the password column, and long all-"
+                   "uppercase tokens that don't match a known hash format. 'Unrelated' lines are "
+                   "credentials in the same exported files but not tied to the domain "
+                   "(see --include-unrelated)"))
     ws.column_dimensions["A"].width = 40
     ws.column_dimensions["B"].width = 30
 
@@ -834,21 +905,26 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("zip", metavar="EXPORT_ZIP", help="Path to the IntelX export .zip")
     p.add_argument("-o", "--output", help="Output .xlsx path (default: <zip name>_leaks.xlsx)")
     p.add_argument("-d", "--domain",
-                   help="Domain searched on IntelX (e.g. example.com). Strongly recommended; "
-                        "if omitted it is inferred from the most common email domain.")
+                   help="Domain searched on IntelX (e.g. example.com). If omitted, it is "
+                        "inferred from the most common email domain (unreliable on large "
+                        "multi-breach exports).")
     p.add_argument("--include-unrelated", action="store_true",
                    help="Also export credentials NOT tied to the domain (co-resident in the "
                         "exported dumps) to a separate CSV. Can be very large.")
     group = p.add_mutually_exclusive_group()
     group.add_argument("--only-domain-emails", action="store_true",
-                       help="Export only professional leaks (emails on the searched domain).")
+                       help="Export only professional leaks. Mutually exclusive with "
+                            "--only-personal-emails.")
     group.add_argument("--only-personal-emails", action="store_true",
-                       help="Export only personal leaks (app users on the domain).")
-    p.add_argument("-v", "--verbose", action="store_true", help="Verbose logging.")
+                       help="Export only personal leaks. Mutually exclusive with "
+                            "--only-domain-emails.")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="Verbose logging (shows which files are skipped and why).")
     return p.parse_args(argv)
 
 
 def main(argv=None) -> int:
+    print(BANNER)
     args = parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s: %(message)s")
